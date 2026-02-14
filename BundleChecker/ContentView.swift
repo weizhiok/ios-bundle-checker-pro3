@@ -5,7 +5,7 @@ import Darwin
 import MachO
 
 // ========================================================================
-// 🛠️ C-Bridge 定义区 (放在最外层，绝对安全)
+// 🛠️ C-Bridge 定义区
 // ========================================================================
 
 // 1. dladdr 结构体与函数
@@ -46,8 +46,9 @@ func SecCodeCopySelf(_ flags: UInt32, _ code: UnsafeMutablePointer<SecCodeRef?>)
 @_silgen_name("SecCodeCopySigningInformation")
 func SecCodeCopySigningInformation(_ code: SecCodeRef, _ flags: UInt32, _ info: UnsafeMutablePointer<CFDictionary?>?) -> Int32
 
-@_silgen_name("SecTaskCreateFromAuditToken")
-func SecTaskCreateFromAuditToken(_ tokenData: UnsafeRawPointer) -> SecTaskRef?
+// 【修正点】删除静态声明，改用 dlsym 动态查找，避免 Linker Error
+// @_silgen_name("SecTaskCreateFromAuditToken") 
+// func SecTaskCreateFromAuditToken(_ tokenData: UnsafeRawPointer) -> SecTaskRef?
 
 // Audit Token 结构 (8个 UInt32)
 struct audit_token_t_swift {
@@ -68,7 +69,7 @@ struct BundleCheckerApp: App {
 }
 
 // ========================================================================
-// 🖥️ 视图与逻辑 (所有函数必须包含在这里面)
+// 🖥️ 视图与逻辑
 // ========================================================================
 
 struct ContentView: View {
@@ -91,7 +92,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("BundleID 终极检测 V8")
+            Text("BundleID 终极检测 V9")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity)
@@ -218,7 +219,7 @@ struct ContentView: View {
         items.append(ResultItem(
             method: "7. [审计] Audit Token",
             value: auditID,
-            detail: "进程任务令牌",
+            detail: "进程任务令牌 (dlsym)",
             status: stripTeamID(auditID) == cleanKernelID ? .safe : .suspicious
         ))
         
@@ -242,7 +243,6 @@ struct ContentView: View {
         
         // 10. Provisioning
         let provID = getMobileProvisionID()
-        // 只要包含内核ID就算通过(允许自签)
         let isProvSafe = provID.contains(cleanKernelID) || provID == kernelID
         items.append(ResultItem(
             method: "10. [证书] mobileprovision",
@@ -264,13 +264,12 @@ struct ContentView: View {
     }
     
     // ========================================================================
-    // 🛠️ 辅助函数实现 (全部在 ContentView 内部)
+    // 🛠️ 辅助函数实现
     // ========================================================================
     
     func stripTeamID(_ fullID: String) -> String {
         let components = fullID.components(separatedBy: ".")
         if components.count > 1 && components[0].count == 10 {
-            // 简单校验第一段是否像 TeamID (10位字母数字)
             let potentialTeamID = components[0]
             let charset = CharacterSet.alphanumerics
             if potentialTeamID.rangeOfCharacter(from: charset.inverted) == nil {
@@ -343,12 +342,10 @@ struct ContentView: View {
         return "SecCode Fail"
     }
     
-    // 6. Audit Token
+    // 6. Audit Token (动态调用版)
     func getAuditTokenID() -> String {
         var token = audit_token_t_swift()
         var size = mach_msg_type_number_t(MemoryLayout<audit_token_t_swift>.size / 4)
-        
-        // 关键修复: 使用 UInt32 (task_flavor_t)
         let kTaskAuditToken: task_flavor_t = 15
         
         let result = withUnsafeMutablePointer(to: &token) { ptr -> Int32 in
@@ -357,8 +354,22 @@ struct ContentView: View {
         }
         
         if result == 0 {
+            // 【修正】使用 dlsym 动态查找 SecTaskCreateFromAuditToken
+            let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
+            guard let sym = dlsym(RTLD_DEFAULT, "SecTaskCreateFromAuditToken") else {
+                return "Symbol Not Found"
+            }
+            
+            // 定义函数指针: SecTaskRef SecTaskCreateFromAuditToken(audit_token_t *token)
+            typealias SecTaskCreateFunc = @convention(c) (UnsafeRawPointer) -> Unmanaged<AnyObject>?
+            
+            let funcPtr = unsafeBitCast(sym, to: SecTaskCreateFunc.self)
+            
             return withUnsafePointer(to: &token) { ptr -> String in
-                guard let secTask = SecTaskCreateFromAuditToken(ptr) else { return "Token Invalid" }
+                // 调用动态找到的函数
+                guard let unmanagedTask = funcPtr(ptr) else { return "Token Invalid" }
+                let secTask = unmanagedTask.takeUnretainedValue()
+                
                 if let idRef = SecTaskCopySigningIdentifier(secTask, nil) {
                     return idRef as String
                 }
@@ -485,5 +496,4 @@ struct ContentView: View {
         }
         return (false, "dladdr Failed")
     }
-    
-} // ⬅️ 这个大括号非常重要，它是 ContentView 的结束
+}
