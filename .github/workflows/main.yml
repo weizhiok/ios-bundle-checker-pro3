@@ -1,0 +1,53 @@
+name: Build iOS IPA
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest-stable'
+      - name: Build IPA
+        run: |
+          mkdir -p build
+          # 关键参数：-framework Security (用于SecTask)
+          swiftc -parse-as-library -target arm64-apple-ios15.0 -sdk $(xcrun --show-sdk-path --sdk iphoneos) -O -o BundleCheckerBinary -framework Security BundleChecker/ContentView.swift
+          
+          mkdir -p Payload/BundleChecker.app
+          mv BundleCheckerBinary Payload/BundleChecker.app/
+          
+          cat <<EOF > Payload/BundleChecker.app/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>BundleCheckerBinary</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.user.bundlechecker</string>
+              <key>CFBundleName</key>
+              <string>BundleCheck</string>
+              <key>CFBundleShortVersionString</key>
+              <string>2.0</string>
+              <key>CFBundleVersion</key>
+              <string>2</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+              </array>
+          </dict>
+          </plist>
+          EOF
+          zip -r BundleChecker.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BundleChecker-IPA
+          path: BundleChecker.ipa
