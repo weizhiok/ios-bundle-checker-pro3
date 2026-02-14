@@ -2,13 +2,12 @@ import SwiftUI
 import Security
 import Foundation
 import Darwin
-import MachO
 
 // ========================================================================
-// 🛠️ C-Bridge 定义区
+// 🛠️ C-Bridge 定义区 (底层 C 函数映射)
 // ========================================================================
 
-// 1. dladdr 结构体与函数
+// 1. dladdr 结构体与函数 (用于 Runtime 检测)
 struct Local_Dl_info {
     var dli_fname: UnsafePointer<CChar>?
     var dli_fbase: UnsafeMutableRawPointer?
@@ -16,11 +15,9 @@ struct Local_Dl_info {
     var dli_saddr: UnsafeMutableRawPointer?
 }
 
-// 使用 RawPointer 绕过 Swift 类型检查
 func safe_dladdr(_ addr: UnsafeRawPointer, _ info: UnsafeMutablePointer<Local_Dl_info>) -> Int32 {
     let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
     guard let sym = dlsym(RTLD_DEFAULT, "dladdr") else { return 0 }
-    
     typealias DlAddrFunc = @convention(c) (UnsafeRawPointer, UnsafeMutableRawPointer) -> Int32
     let dladdr_real = unsafeBitCast(sym, to: DlAddrFunc.self)
     let infoRaw = UnsafeMutableRawPointer(info)
@@ -46,15 +43,6 @@ func SecCodeCopySelf(_ flags: UInt32, _ code: UnsafeMutablePointer<SecCodeRef?>)
 @_silgen_name("SecCodeCopySigningInformation")
 func SecCodeCopySigningInformation(_ code: SecCodeRef, _ flags: UInt32, _ info: UnsafeMutablePointer<CFDictionary?>?) -> Int32
 
-// 【修正点】删除静态声明，改用 dlsym 动态查找，避免 Linker Error
-// @_silgen_name("SecTaskCreateFromAuditToken") 
-// func SecTaskCreateFromAuditToken(_ tokenData: UnsafeRawPointer) -> SecTaskRef?
-
-// Audit Token 结构 (8个 UInt32)
-struct audit_token_t_swift {
-    var val: (UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32) = (0,0,0,0,0,0,0,0)
-}
-
 // ========================================================================
 // 📱 主程序入口
 // ========================================================================
@@ -75,6 +63,10 @@ struct BundleCheckerApp: App {
 struct ContentView: View {
     @State private var results: [ResultItem] = []
     @State private var isLoading = true
+    
+    // 🎯 【核心设置】你的原始 BundleID
+    // 只有检测结果不等于这个值时，才会报红
+    let targetBundleID = "com.user.bundlechecker"
 
     struct ResultItem: Hashable, Identifiable {
         let id = UUID()
@@ -85,14 +77,14 @@ struct ContentView: View {
     }
 
     enum Status {
-        case safe
-        case suspicious
-        case info
+        case safe       // 正常 (黑色/绿色)
+        case suspicious // 异常 (红色) - 只有 ID 不匹配才用这个
+        case info       // 信息 (蓝色/灰色) - 用于展示证书等不可控信息
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("BundleID 终极检测 V9")
+            Text("BundleID 篡改检测")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity)
@@ -102,7 +94,7 @@ struct ContentView: View {
                 VStack {
                     ProgressView()
                         .padding()
-                    Text("正在扫描底层指纹...")
+                    Text("正在提取签名指纹...")
                         .font(.caption)
                         .foregroundColor(.gray)
                 }
@@ -144,7 +136,7 @@ struct ContentView: View {
 
     func colorForStatus(_ status: Status) -> Color {
         switch status {
-        case .safe: return .primary
+        case .safe: return .primary // 正常显示黑色(深色模式白)
         case .suspicious: return .red
         case .info: return .blue
         }
@@ -157,104 +149,97 @@ struct ContentView: View {
     func performAllChecks() {
         var items: [ResultItem] = []
         
-        // 0. 基准
-        let kernelID = getSecTaskSigningIdentifier()
-        let cleanKernelID = stripTeamID(kernelID)
+        // --- 第一部分：BundleID 一致性检测 ---
+        // 这里的逻辑是：必须等于 com.user.bundlechecker，否则报红
         
-        // 1. OC API
+        // 1. [OC API] Bundle.main
         let nsID = Bundle.main.bundleIdentifier ?? "nil"
         items.append(ResultItem(
             method: "1. [OC API] Bundle.main",
             value: nsID,
             detail: "应用层 API (易被 Hook)",
-            status: nsID == cleanKernelID ? .safe : .suspicious
+            status: nsID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 2. C API
+        // 2. [C API] CFBundleIdentifier
         let cfID = getCFBundleIdentifier()
         items.append(ResultItem(
             method: "2. [C API] CFBundleGetIdentifier",
             value: cfID,
-            detail: "CoreFoundation 底层",
-            status: cfID == cleanKernelID ? .safe : .suspicious
+            detail: "CoreFoundation 底层获取",
+            status: cfID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 3. Dict Read
+        // 3. [IO] Info.plist (Cocoa)
         let dictID = getDictFromInfo()
         items.append(ResultItem(
-            method: "3. [IO] Info.plist 字典",
+            method: "3. [IO] Info.plist 字典读取",
             value: dictID,
-            detail: "Cocoa 文件读取",
-            status: dictID == cleanKernelID ? .safe : .suspicious
+            detail: "文件系统层面读取 (Cocoa)",
+            status: dictID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 4. fopen
+        // 4. [IO] fopen (C Standard)
         let fopenID = getBundleIDFromPlistUsingFopen()
         items.append(ResultItem(
             method: "4. [IO] fopen 直接读取",
             value: fopenID,
-            detail: "C语言标准库读取",
-            status: fopenID == cleanKernelID ? .safe : .suspicious
+            detail: "绕过 Runtime 的文件读取",
+            status: fopenID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 5. SecTask
+        // 5. [内核] SecTask
+        let kernelID = getSecTaskSigningIdentifier()
+        // SecTask 读出来的 ID 有时带 TeamID 前缀，有时不带，这里做个智能剥离
+        let cleanKernelID = stripTeamID(kernelID)
         items.append(ResultItem(
-            method: "5. [内核] SecTask",
+            method: "5. [内核] SecTask ID",
             value: kernelID,
-            detail: "内核 Entitlements (基准)",
-            status: .safe
+            detail: "基于 Entitlements 的内核视角",
+            status: cleanKernelID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 6. SecCode
+        // 6. [安全框架] SecCode API
+        // 如果获取失败，显示"N/A"但不报红
         let secCodeID = getSecCodeID()
+        let secCodeStatus: Status
+        if secCodeID == "N/A" || secCodeID.contains("Fail") {
+            secCodeStatus = .safe // 获取不到算正常，不吓唬用户
+        } else {
+            secCodeStatus = stripTeamID(secCodeID) == targetBundleID ? .safe : .suspicious
+        }
         items.append(ResultItem(
             method: "6. [安全框架] SecCode API",
             value: secCodeID,
             detail: "Security 静态代码对象",
-            status: stripTeamID(secCodeID) == cleanKernelID ? .safe : .suspicious
+            status: secCodeStatus
         ))
         
-        // 7. Audit Token
-        let auditID = getAuditTokenID()
-        items.append(ResultItem(
-            method: "7. [审计] Audit Token",
-            value: auditID,
-            detail: "进程任务令牌 (dlsym)",
-            status: stripTeamID(auditID) == cleanKernelID ? .safe : .suspicious
-        ))
+        // --- 第二部分：签名信息展示 (不判红) ---
+        // 这里的逻辑是：只展示，永远不报红，因为自签名必然会变
         
-        // 8. Mach-O
-        let machoID = getMachOEmbeddedInfoID()
-        items.append(ResultItem(
-            method: "8. [二进制] Mach-O",
-            value: machoID,
-            detail: "解析 __TEXT.__info_plist",
-            status: machoID == cleanKernelID ? .safe : .suspicious
-        ))
-        
-        // 9. Entitlements
+        // 7. [授权] Entitlements 字段
         let entID = getEntitlementsAppID()
         items.append(ResultItem(
-            method: "9. [授权] application-identifier",
+            method: "7. [授权] application-identifier",
             value: entID,
-            detail: "直接读取授权字段",
-            status: stripTeamID(entID) == cleanKernelID ? .safe : .suspicious
+            detail: "当前签名的授权 ID (展示用)",
+            status: .safe // 永远正常
         ))
-        
-        // 10. Provisioning
+
+        // 8. [证书] Provisioning Profile
         let provID = getMobileProvisionID()
-        let isProvSafe = provID.contains(cleanKernelID) || provID == kernelID
         items.append(ResultItem(
-            method: "10. [证书] mobileprovision",
+            method: "8. [证书] mobileprovision",
             value: provID,
-            detail: "签名描述文件",
-            status: isProvSafe ? .safe : .suspicious
+            detail: "当前签名的证书 ID (展示用)",
+            status: .safe // 永远正常
         ))
         
-        // 11. Runtime
+        // 9. [Runtime] 方法地址检测
         let (rtStatus, rtMsg) = checkRuntimeIntegrity()
         items.append(ResultItem(
-            method: "11. [Runtime] Swizzle 检测",
+            method: "9. [Runtime] Swizzle 检测",
             value: rtStatus ? "Safe" : "Hooked",
             detail: rtMsg,
             status: rtStatus ? .safe : .suspicious
@@ -331,6 +316,7 @@ struct ContentView: View {
     // 5. SecCode
     func getSecCodeID() -> String {
         var code: SecCodeRef? = nil
+        // 尝试获取 Code 对象，如果失败直接返回 N/A
         if SecCodeCopySelf(0, &code) == 0, let validCode = code {
             var info: CFDictionary? = nil
             if SecCodeCopySigningInformation(validCode, 1, &info) == 0, let validInfo = info as? [String: Any] {
@@ -339,113 +325,10 @@ struct ContentView: View {
                 }
             }
         }
-        return "SecCode Fail"
+        return "N/A"
     }
     
-    // 6. Audit Token (动态调用版)
-    func getAuditTokenID() -> String {
-        var token = audit_token_t_swift()
-        var size = mach_msg_type_number_t(MemoryLayout<audit_token_t_swift>.size / 4)
-        let kTaskAuditToken: task_flavor_t = 15
-        
-        let result = withUnsafeMutablePointer(to: &token) { ptr -> Int32 in
-            let intPtr = ptr.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { $0 }
-            return task_info(mach_task_self_, kTaskAuditToken, intPtr, &size)
-        }
-        
-        if result == 0 {
-            // 【修正】使用 dlsym 动态查找 SecTaskCreateFromAuditToken
-            let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
-            guard let sym = dlsym(RTLD_DEFAULT, "SecTaskCreateFromAuditToken") else {
-                return "Symbol Not Found"
-            }
-            
-            // 定义函数指针: SecTaskRef SecTaskCreateFromAuditToken(audit_token_t *token)
-            typealias SecTaskCreateFunc = @convention(c) (UnsafeRawPointer) -> Unmanaged<AnyObject>?
-            
-            let funcPtr = unsafeBitCast(sym, to: SecTaskCreateFunc.self)
-            
-            return withUnsafePointer(to: &token) { ptr -> String in
-                // 调用动态找到的函数
-                guard let unmanagedTask = funcPtr(ptr) else { return "Token Invalid" }
-                let secTask = unmanagedTask.takeUnretainedValue()
-                
-                if let idRef = SecTaskCopySigningIdentifier(secTask, nil) {
-                    return idRef as String
-                }
-                return "Token No ID"
-            }
-        }
-        return "Task Info Fail"
-    }
-    
-    // 7. Mach-O
-    func getMachOEmbeddedInfoID() -> String {
-        guard let path = Bundle.main.executablePath else { return "No Exec" }
-        guard let file = fopen(path, "r") else { return "Open Fail" }
-        defer { fclose(file) }
-        
-        var header = mach_header_64()
-        if fread(&header, MemoryLayout<mach_header_64>.size, 1, file) != 1 { return "Read Header Fail" }
-        if header.magic != MH_MAGIC_64 { return "Not 64-bit" }
-        
-        var cmdOffset = MemoryLayout<mach_header_64>.size
-        var lc = load_command()
-        
-        for _ in 0..<header.ncmds {
-            fseek(file, 0, SEEK_SET)
-            fseek(file, Int(cmdOffset), SEEK_CUR)
-            if fread(&lc, MemoryLayout<load_command>.size, 1, file) != 1 { break }
-            
-            if lc.cmd == 0x19 { // LC_SEGMENT_64
-                fseek(file, 0, SEEK_SET)
-                fseek(file, Int(cmdOffset), SEEK_CUR)
-                var seg = segment_command_64()
-                if fread(&seg, MemoryLayout<segment_command_64>.size, 1, file) != 1 { break }
-                
-                let segName = withUnsafePointer(to: &seg.segname) {
-                    $0.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) }
-                }
-                
-                if segName == "__TEXT" {
-                    var sectOffset = cmdOffset + MemoryLayout<segment_command_64>.size
-                    for _ in 0..<seg.nsects {
-                        fseek(file, 0, SEEK_SET)
-                        fseek(file, Int(sectOffset), SEEK_CUR)
-                        var sect = section_64()
-                        if fread(&sect, MemoryLayout<section_64>.size, 1, file) != 1 { break }
-                        
-                        let sectName = withUnsafePointer(to: &sect.sectname) {
-                            $0.withMemoryRebound(to: CChar.self, capacity: 16) { String(cString: $0) }
-                        }
-                        
-                        if sectName == "__info_plist" {
-                            let size = Int(sect.size)
-                            let offset = Int(sect.offset)
-                            if size > 0 {
-                                fseek(file, 0, SEEK_SET)
-                                fseek(file, offset, SEEK_CUR)
-                                var buffer = [CChar](repeating: 0, count: size + 1)
-                                fread(&buffer, 1, size, file)
-                                let content = String(cString: buffer)
-                                if let range = content.range(of: "CFBundleIdentifier") {
-                                    let sub = content[range.upperBound...]
-                                    if let start = sub.range(of: "<string>"), let end = sub.range(of: "</string>") {
-                                        return String(sub[start.upperBound..<end.lowerBound])
-                                    }
-                                }
-                            }
-                        }
-                        sectOffset += MemoryLayout<section_64>.size
-                    }
-                }
-            }
-            cmdOffset += Int(lc.cmdsize)
-        }
-        return "Not Found"
-    }
-    
-    // 8. Entitlements
+    // 6. Entitlements
     func getEntitlementsAppID() -> String {
         guard let secTask = SecTaskCreateFromSelf(kCFAllocatorDefault) else { return "Fail" }
         let key = "application-identifier" as CFString
@@ -455,7 +338,7 @@ struct ContentView: View {
         return "Not Found"
     }
     
-    // 9. Provisioning
+    // 7. Provisioning
     func getMobileProvisionID() -> String {
         guard let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision") else {
             return "未找到 (可能是模拟器)"
@@ -473,7 +356,7 @@ struct ContentView: View {
         return "未找到 ID 字段"
     }
     
-    // 10. Runtime Check
+    // 8. Runtime Check
     func checkRuntimeIntegrity() -> (Bool, String) {
         let selector = #selector(getter: Bundle.bundleIdentifier)
         guard let method = class_getInstanceMethod(Bundle.self, selector) else {
@@ -496,4 +379,5 @@ struct ContentView: View {
         }
         return (false, "dladdr Failed")
     }
+    
 }
