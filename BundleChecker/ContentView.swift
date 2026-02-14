@@ -26,7 +26,6 @@ func safe_dladdr(_ addr: UnsafeRawPointer, _ info: UnsafeMutablePointer<Local_Dl
 
 // 2. Security / Kernel 定义
 typealias SecTaskRef = AnyObject
-typealias SecCodeRef = AnyObject
 
 @_silgen_name("SecTaskCreateFromSelf")
 func SecTaskCreateFromSelf(_ allocator: CFAllocator?) -> SecTaskRef?
@@ -36,12 +35,6 @@ func SecTaskCopySigningIdentifier(_ task: SecTaskRef, _ error: UnsafeMutablePoin
 
 @_silgen_name("SecTaskCopyValueForEntitlement")
 func SecTaskCopyValueForEntitlement(_ task: SecTaskRef, _ entitlement: CFString, _ error: UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFTypeRef?
-
-@_silgen_name("SecCodeCopySelf")
-func SecCodeCopySelf(_ flags: UInt32, _ code: UnsafeMutablePointer<SecCodeRef?>) -> Int32
-
-@_silgen_name("SecCodeCopySigningInformation")
-func SecCodeCopySigningInformation(_ code: SecCodeRef, _ flags: UInt32, _ info: UnsafeMutablePointer<CFDictionary?>?) -> Int32
 
 // ========================================================================
 // 📱 主程序入口
@@ -65,7 +58,7 @@ struct ContentView: View {
     @State private var isLoading = true
     
     // 🎯 【核心设置】你的原始 BundleID
-    // 只有检测结果不等于这个值时，才会报红
+    // 只有检测结果不等于这个值时，前几项才会报红
     let targetBundleID = "com.user.bundlechecker"
 
     struct ResultItem: Hashable, Identifiable {
@@ -78,13 +71,13 @@ struct ContentView: View {
 
     enum Status {
         case safe       // 正常 (黑色/绿色)
-        case suspicious // 异常 (红色) - 只有 ID 不匹配才用这个
-        case info       // 信息 (蓝色/灰色) - 用于展示证书等不可控信息
+        case suspicious // 异常 (红色)
+        case info       // 信息 (蓝色/灰色)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            Text("BundleID 篡改检测")
+            Text("BundleID 篡改检测 V10")
                 .font(.headline)
                 .padding()
                 .frame(maxWidth: .infinity)
@@ -94,7 +87,7 @@ struct ContentView: View {
                 VStack {
                     ProgressView()
                         .padding()
-                    Text("正在提取签名指纹...")
+                    Text("正在进行全维取证...")
                         .font(.caption)
                         .foregroundColor(.gray)
                 }
@@ -136,9 +129,9 @@ struct ContentView: View {
 
     func colorForStatus(_ status: Status) -> Color {
         switch status {
-        case .safe: return .primary // 正常显示黑色(深色模式白)
-        case .suspicious: return .red
-        case .info: return .blue
+        case .safe: return .primary // 正常
+        case .suspicious: return .red   // 异常
+        case .info: return .blue    // 信息
         }
     }
 
@@ -149,10 +142,9 @@ struct ContentView: View {
     func performAllChecks() {
         var items: [ResultItem] = []
         
-        // --- 第一部分：BundleID 一致性检测 ---
-        // 这里的逻辑是：必须等于 com.user.bundlechecker，否则报红
+        // --- 第一部分：基准检测 (对比 com.user.bundlechecker) ---
         
-        // 1. [OC API] Bundle.main
+        // 1. [OC API]
         let nsID = Bundle.main.bundleIdentifier ?? "nil"
         items.append(ResultItem(
             method: "1. [OC API] Bundle.main",
@@ -161,7 +153,7 @@ struct ContentView: View {
             status: nsID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 2. [C API] CFBundleIdentifier
+        // 2. [C API]
         let cfID = getCFBundleIdentifier()
         items.append(ResultItem(
             method: "2. [C API] CFBundleGetIdentifier",
@@ -170,16 +162,16 @@ struct ContentView: View {
             status: cfID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 3. [IO] Info.plist (Cocoa)
+        // 3. [IO] Info.plist
         let dictID = getDictFromInfo()
         items.append(ResultItem(
             method: "3. [IO] Info.plist 字典读取",
             value: dictID,
-            detail: "文件系统层面读取 (Cocoa)",
+            detail: "Cocoa 文件读取",
             status: dictID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 4. [IO] fopen (C Standard)
+        // 4. [IO] fopen
         let fopenID = getBundleIDFromPlistUsingFopen()
         items.append(ResultItem(
             method: "4. [IO] fopen 直接读取",
@@ -190,7 +182,6 @@ struct ContentView: View {
         
         // 5. [内核] SecTask
         let kernelID = getSecTaskSigningIdentifier()
-        // SecTask 读出来的 ID 有时带 TeamID 前缀，有时不带，这里做个智能剥离
         let cleanKernelID = stripTeamID(kernelID)
         items.append(ResultItem(
             method: "5. [内核] SecTask ID",
@@ -199,47 +190,44 @@ struct ContentView: View {
             status: cleanKernelID == targetBundleID ? .safe : .suspicious
         ))
         
-        // 6. [安全框架] SecCode API
-        // 如果获取失败，显示"N/A"但不报红
-        let secCodeID = getSecCodeID()
-        let secCodeStatus: Status
-        if secCodeID == "N/A" || secCodeID.contains("Fail") {
-            secCodeStatus = .safe // 获取不到算正常，不吓唬用户
-        } else {
-            secCodeStatus = stripTeamID(secCodeID) == targetBundleID ? .safe : .suspicious
-        }
-        items.append(ResultItem(
-            method: "6. [安全框架] SecCode API",
-            value: secCodeID,
-            detail: "Security 静态代码对象",
-            status: secCodeStatus
-        ))
+        // --- 第二部分：一致性交叉对比 (授权 vs 证书) ---
+        // 这里的逻辑：不管你签成什么样，这两者必须一致，否则红名
         
-        // --- 第二部分：签名信息展示 (不判红) ---
-        // 这里的逻辑是：只展示，永远不报红，因为自签名必然会变
-        
-        // 7. [授权] Entitlements 字段
+        // 6. [授权] Entitlements
         let entID = getEntitlementsAppID()
+        
+        // 7. [证书] Provisioning Profile
+        let provID = getMobileProvisionID()
+        
+        // 核心逻辑：交叉对比
+        // 通常 entID 包含 TeamID (如 A1B2.com.x)，provID 也包含。
+        // 如果 provID 包含 entID，或者两者完全相等，则视为一致。
+        let isSignatureConsistent = (provID == entID) || provID.contains(entID) || entID.contains(provID)
+        
+        // 如果获取失败（显示 Not Found），也标记为 info 或 suspicious，看你喜好。这里设为 suspicious 提醒注意
+        let entStatus: Status = (entID.contains("Fail") || entID.contains("Found")) ? .info : (isSignatureConsistent ? .safe : .suspicious)
+        let provStatus: Status = (provID.contains("未找到") || provID.contains("错误")) ? .info : (isSignatureConsistent ? .safe : .suspicious)
+
         items.append(ResultItem(
-            method: "7. [授权] application-identifier",
+            method: "6. [授权] application-identifier",
             value: entID,
-            detail: "当前签名的授权 ID (展示用)",
-            status: .safe // 永远正常
+            detail: "App 二进制内部权限声明",
+            status: entStatus
         ))
 
-        // 8. [证书] Provisioning Profile
-        let provID = getMobileProvisionID()
         items.append(ResultItem(
-            method: "8. [证书] mobileprovision",
+            method: "7. [证书] mobileprovision",
             value: provID,
-            detail: "当前签名的证书 ID (展示用)",
-            status: .safe // 永远正常
+            detail: "App 外部签名文件声明",
+            status: provStatus
         ))
         
-        // 9. [Runtime] 方法地址检测
+        // --- 第三部分：环境完整性 ---
+        
+        // 8. [Runtime] Swizzle 检测
         let (rtStatus, rtMsg) = checkRuntimeIntegrity()
         items.append(ResultItem(
-            method: "9. [Runtime] Swizzle 检测",
+            method: "8. [Runtime] Swizzle 检测",
             value: rtStatus ? "Safe" : "Hooked",
             detail: rtMsg,
             status: rtStatus ? .safe : .suspicious
@@ -313,21 +301,6 @@ struct ContentView: View {
         return "Unknown"
     }
     
-    // 5. SecCode
-    func getSecCodeID() -> String {
-        var code: SecCodeRef? = nil
-        // 尝试获取 Code 对象，如果失败直接返回 N/A
-        if SecCodeCopySelf(0, &code) == 0, let validCode = code {
-            var info: CFDictionary? = nil
-            if SecCodeCopySigningInformation(validCode, 1, &info) == 0, let validInfo = info as? [String: Any] {
-                if let id = validInfo["identifier"] as? String {
-                    return id
-                }
-            }
-        }
-        return "N/A"
-    }
-    
     // 6. Entitlements
     func getEntitlementsAppID() -> String {
         guard let secTask = SecTaskCreateFromSelf(kCFAllocatorDefault) else { return "Fail" }
@@ -379,5 +352,4 @@ struct ContentView: View {
         }
         return (false, "dladdr Failed")
     }
-    
 }
